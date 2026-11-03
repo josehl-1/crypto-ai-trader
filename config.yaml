@@ -1,0 +1,65 @@
+# ============================================================
+#  Crypto AI Trader - configuración
+# ============================================================
+exchange:
+  id: binance            # cualquier exchange soportado por ccxt (binance, kraken, bybit, okx, kucoin...)
+  quote: USDT
+  sandbox: false         # true = testnet del exchange (recomendado antes de dinero real)
+
+data:
+  source: exchange       # exchange | synthetic (datos simulados para pruebas offline)
+  synthetic_fallback: false  # true = si falla la descarga, rellenar con sintéticos (solo visual; el bot nunca opera sobre ellos)
+  timeframe: 1h
+  history_bars: 2000     # velas de historia por símbolo
+
+universe:
+  # Si top_n > 0 se seleccionan automáticamente los N pares con más volumen (ignora 'symbols')
+  top_n: 0
+  symbols: [BTC/USDT, ETH/USDT, SOL/USDT, BNB/USDT, XRP/USDT, ADA/USDT, DOGE/USDT,
+            AVAX/USDT, LINK/USDT, DOT/USDT, LTC/USDT, TRX/USDT, ATOM/USDT, NEAR/USDT,
+            UNI/USDT, APT/USDT, ARB/USDT, OP/USDT, SUI/USDT, INJ/USDT]
+  min_quote_volume_24h: 5000000   # filtro de liquidez (en moneda quote)
+  max_concurrency: 10             # descargas simultáneas
+  model_workers: 4                # modelos entrenados en paralelo
+
+model:
+  horizon: 6               # velas a futuro que predice el modelo
+  label_threshold: 0.002   # retorno mínimo para considerar "sube" (cubre comisiones)
+  test_size: 0.2           # holdout final (fuera de muestra) para validar
+  min_auc: 0.53            # el modelo debe superar al azar para operar ese símbolo
+  min_holdout_signals: 10
+  require_positive_holdout_edge: true
+  retrain_hours: 12
+  model_dir: models
+
+strategy:
+  buy_prob: 0.58             # prob. mínima de subida para comprar
+  exit_prob: 0.45            # si la prob. cae por debajo -> salir
+  min_expected_return: 0.003 # retorno mediano esperado mínimo (q50)
+
+risk:
+  starting_equity: 10000
+  risk_per_trade: 0.01       # 1% del capital arriesgado por operación (hasta el stop)
+  max_position_pct: 0.20     # máximo 20% del capital en una posición
+  max_open_positions: 5
+  atr_stop_mult: 2.0         # stop = entrada - 2*ATR
+  reward_risk: 2.0           # take profit = 2R
+  trailing_stop: true
+  max_holding_bars: 48
+  max_daily_loss_pct: 0.05   # kill switch: sin nuevas entradas si se pierde 5% en el día
+  min_notional: 10
+
+execution:
+  mode: paper                # paper | live
+  fee_rate: 0.001
+  slippage: 0.0005
+
+bot:
+  loop_seconds: 300
+
+backtest:
+  min_train_bars: 800
+  retrain_every: 168
+
+storage:
+  db_path: data/trader.db
