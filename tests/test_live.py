@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
+import iniciar_real
 import trader.broker as broker_mod
 from probar_ordenes_testnet import run_checks
 from trader.bot import TradingBot
@@ -20,6 +21,10 @@ class FakeExchange:
     id = "fake"
     has = {"createStopLossOrder": True}
     urls = {"api": {"public": "https://testnet.binance.vision/api/v3"}}
+    restrictions = {"enableWithdrawals": False, "enableSpotAndMarginTrading": True}
+
+    def sapiGetAccountApiRestrictions(self):
+        return self.restrictions
 
     def __init__(self):
         self.balance = {"USDT": 1000.0, "ETH": 5.0, "BTC": 5.0}
@@ -500,6 +505,123 @@ def test_order_check_reports_rejected_buy(cfg, fake):
     lines = []
     assert run_checks(order_check_broker(cfg), out=lines.append) is False
     assert any("rechazada" in line for line in lines)
+
+
+# ---------------------------------------------------------------- asistente de dinero real
+class RecordingBot:
+    """Sustituye al bot: comprueba si el asistente llegó a operar, sin operar."""
+    instances = []
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.cycles = 0
+        self.forever = False
+        RecordingBot.instances.append(self)
+
+    def run_cycle(self):
+        self.cycles += 1
+        return {"scanned": 20, "buy_signals": 0, "opened": [], "closed": [], "positions": 0, "equity": 100.0}
+
+    def run_forever(self):
+        self.forever = True
+
+
+@pytest.fixture
+def assistant(cfg, fake, tmp_path, monkeypatch):
+    RecordingBot.instances = []
+    real = override(cfg, execution__mode="live", exchange__sandbox=False, exchange__id="binance")
+    monkeypatch.setattr(iniciar_real, "load_live_config", lambda: real)
+    monkeypatch.setattr(iniciar_real, "TradingBot", RecordingBot)
+    monkeypatch.setattr(iniciar_real, "LOG", tmp_path / "real.log")
+    keys = iter(["k" * 64, "s" * 64])
+    monkeypatch.setattr(iniciar_real, "ask_key", lambda *a, **k: next(keys))
+    monkeypatch.setattr(iniciar_real, "clipboard", lambda text=None: "")
+
+    def answer(*replies):
+        pending = iter(replies)
+        monkeypatch.setattr("builtins.input", lambda prompt="": next(pending))
+
+    return answer
+
+
+def test_assistant_needs_exact_phrase_before_trading(assistant, fake):
+    assistant("100", "si")
+    assert iniciar_real.run() == 0
+    assert RecordingBot.instances == [] and fake.orders == []
+
+
+def test_assistant_runs_one_cycle_after_confirmation(assistant, fake):
+    assistant("100", iniciar_real.CONFIRM_PHRASE, "")
+    assert iniciar_real.run() == 0
+    bot = RecordingBot.instances[0]
+    assert (bot.cycles, bot.forever) == (1, False)
+    assert bot.cfg["execution"]["max_live_capital"] == 100
+
+
+def test_assistant_continues_only_when_asked(assistant, fake):
+    assistant("100", iniciar_real.CONFIRM_PHRASE, iniciar_real.CONTINUE_WORD)
+    assert iniciar_real.run() == 0
+    assert RecordingBot.instances[0].forever is True
+
+
+def test_assistant_refuses_key_with_withdrawals(assistant, fake, monkeypatch):
+    monkeypatch.setattr(FakeExchange, "restrictions", {"enableWithdrawals": True, "enableSpotAndMarginTrading": True})
+    assistant("100")
+    assert iniciar_real.run() == 1
+    assert RecordingBot.instances == []
+
+
+def test_assistant_refuses_key_without_spot(assistant, fake, monkeypatch):
+    monkeypatch.setattr(FakeExchange, "restrictions", {"enableWithdrawals": False, "enableSpotAndMarginTrading": False})
+    assistant("100")
+    assert iniciar_real.run() == 1
+
+
+def test_assistant_refuses_unreadable_permissions(assistant, fake, monkeypatch):
+    def boom(self):
+        raise ConnectionError("sin permisos")
+
+    monkeypatch.setattr(FakeExchange, "sapiGetAccountApiRestrictions", boom)
+    assistant("100")
+    assert iniciar_real.run() == 1
+    assert RecordingBot.instances == []
+
+
+def test_assistant_refuses_too_little_balance(assistant, fake):
+    fake.balance["USDT"] = 20.0
+    assistant("100")
+    assert iniciar_real.run() == 1
+    assert RecordingBot.instances == []
+
+
+@pytest.mark.parametrize("text", ["abc", "1.000", "1,000", "-100", "49", ""])
+def test_assistant_rejects_bad_capital(text, monkeypatch):
+    replies = iter([text, "100"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(replies))
+    assert iniciar_real.ask_capital(50) == 100
+
+
+def test_assistant_refuses_testnet_config(assistant, cfg, monkeypatch):
+    monkeypatch.setattr(iniciar_real, "load_live_config", lambda: live(cfg, sandbox=True))
+    assert iniciar_real.run() == 1
+
+
+def test_assistant_stays_off_paper_database(assistant, cfg, fake):
+    make_broker(cfg, Storage(cfg["storage"]["db_path"]))
+    assistant("100")
+    assert iniciar_real.run() == 1
+    assert RecordingBot.instances == []
+
+
+def test_assistant_log_hides_keys(assistant, fake, tmp_path, monkeypatch):
+    def boom(self):
+        raise ConnectionError("clave " + "k" * 64 + " rechazada")
+
+    monkeypatch.setattr(FakeExchange, "sapiGetAccountApiRestrictions", boom)
+    assistant("100")
+    iniciar_real.run()
+    text = (tmp_path / "real.log").read_text(encoding="utf-8")
+    assert "rechazada" in text and "k" * 64 not in text
 
 
 # ---------------------------------------------------------------- configs por cuenta

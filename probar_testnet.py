@@ -27,9 +27,9 @@ def clipboard(text: str | None = None) -> str:
     return (done.stdout or "").strip()
 
 
-def ask_key(name: str, other: str = "") -> str:
+def ask_key(name: str, other: str = "", source: str = "la web de la testnet") -> str:
     while True:
-        getpass.getpass(f"\nCopia tu {name} desde la web de la testnet y pulsa Enter aquí (no hace falta pegarla)... ")
+        getpass.getpass(f"\nCopia tu {name} desde {source} y pulsa Enter aquí (no hace falta pegarla)... ")
         key = clipboard()
         if len(key) >= MIN_KEY_LENGTH and not any(c.isspace() for c in key) and key != other:
             print(f"{name} recibida ({len(key)} caracteres).")
