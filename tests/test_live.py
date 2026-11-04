@@ -6,8 +6,8 @@ import pytest
 
 import trader.broker as broker_mod
 from trader.bot import TradingBot
-from trader.broker import LiveBroker, make_broker
-from trader.config import load_config, override
+from trader.broker import LiveBroker, account_id, make_broker
+from trader.config import ROOT, load_config, override
 from trader.data import synthetic_ohlcv
 from trader.risk import Position
 from trader.storage import Storage
@@ -17,10 +17,12 @@ PRICE = 2000.0
 
 class FakeExchange:
     id = "fake"
+    has = {"createStopLossOrder": True}
 
     def __init__(self):
         self.balance = {"USDT": 1000.0, "ETH": 5.0, "BTC": 5.0}
         self.orders = []
+        self.stops = {}
         self.sandbox = False
 
     def set_sandbox_mode(self, value):
@@ -38,7 +40,26 @@ class FakeExchange:
     def market(self, symbol):
         return {"base": symbol.split("/")[0]}
 
-    def create_order(self, symbol, type_, side, amount):
+    def price_to_precision(self, symbol, price):
+        return f"{price:.2f}"
+
+    def fetch_order(self, order_id, symbol):
+        return self.stops[order_id]
+
+    def cancel_order(self, order_id, symbol):
+        order = self.stops[order_id]
+        if order["status"] != "open":
+            raise ConnectionError("la orden ya no está abierta")
+        order["status"] = "canceled"
+        self.balance[symbol.split("/")[0]] += order["amount"] - order["filled"]
+
+    def create_order(self, symbol, type_, side, amount, price=None, params=None):
+        if params:  # stop: bloquea el saldo sin ejecutarse
+            order_id = f"stop-{len(self.stops) + 1}"
+            self.stops[order_id] = {"id": order_id, "symbol": symbol, "status": "open", "amount": amount, "filled": 0,
+                                    "price": price, "trigger": params["stopLossPrice"]}
+            self.balance[symbol.split("/")[0]] -= amount
+            return self.stops[order_id]
         self.orders.append((symbol, type_, side, amount))
         sign = 1 if side == "buy" else -1
         self.balance["USDT"] -= sign * amount * PRICE
@@ -245,3 +266,205 @@ def test_watch_stops_checks_repeatedly(cfg):
 def test_synthetic_source_has_no_live_prices(cfg):
     bot = TradingBot(override(cfg, data__source="synthetic"))
     assert bot.data.fetch_last_prices(["ETH/USDT"]) == {}
+
+
+# ---------------------------------------------------------------- stops en el exchange
+def active_stops(fake):
+    return [o for o in fake.stops.values() if o["status"] == "open"]
+
+
+def test_stop_placed_on_exchange(cfg, fake):
+    bot = prices_bot(live(cfg), {"ETH/USDT": 2000})
+    bot.check_stops()
+    stop = active_stops(fake)[0]
+    assert (stop["trigger"], stop["price"], stop["amount"]) == (1900, 1881, 0.01)
+
+
+def test_new_position_gets_stop_immediately(cfg, fake):
+    c = live(cfg, capital=1000)
+    bot = TradingBot(c)
+    scan = pd.DataFrame({"symbol": ["ETH/USDT"], "signal": "BUY", "tradable": True, "source": "binance", "price": PRICE,
+                         "atr_pct": 0.01, "prob_up": 0.7, "q50": 0.01})
+    bot._open_positions({"ETH/USDT": synthetic_ohlcv("ETH/USDT", "1h", 10)}, scan, {"ETH/USDT": PRICE},
+                        "2026-01-01T00:00:00+00:00")
+    assert len(active_stops(fake)) == 1
+
+
+def test_stop_not_duplicated(cfg, fake):
+    bot = prices_bot(live(cfg), {"ETH/USDT": 2000})
+    bot.check_stops()
+    bot.check_stops()
+    assert len(fake.stops) == 1
+
+
+def test_stop_follows_trailing_up_only(cfg, fake):
+    bot = prices_bot(live(cfg), {"ETH/USDT": 2000})
+    bot.check_stops()
+    pos = bot.storage.get_positions()["ETH/USDT"]
+    pos.stop = 1950
+    bot.storage.upsert_position(pos)
+    bot.check_stops()
+    assert [s["trigger"] for s in active_stops(fake)] == [1950]
+    pos.stop = 1800
+    bot.storage.upsert_position(pos)
+    bot.check_stops()
+    assert [s["trigger"] for s in active_stops(fake)] == [1950]
+
+
+def test_stop_filled_on_exchange_is_recorded(cfg, fake):
+    bot = prices_bot(live(cfg), {"ETH/USDT": 2000})
+    bot.check_stops()
+    stop = active_stops(fake)[0]
+    stop.update(status="closed", filled=0.01, average=1895.0)
+    assert bot.check_stops() == ["ETH/USDT"]
+    assert fake.orders == []  # no se vende dos veces
+    trade = bot.storage.trades().iloc[0]
+    assert (trade["reason"], trade["price"]) == ("exchange_stop", 1895.0)
+
+
+def test_stop_fill_detected_without_prices(cfg, fake):
+    bot = prices_bot(live(cfg), {"ETH/USDT": 2000})
+    bot.check_stops()
+    active_stops(fake)[0].update(status="closed", filled=0.01, average=1895.0)
+
+    def boom(symbols):
+        raise ConnectionError("sin red")
+
+    bot.data.fetch_last_prices = boom
+    assert bot.check_stops() == ["ETH/USDT"]
+
+
+def test_market_close_cancels_stop_first(cfg, fake):
+    fake.balance["ETH"] = 0.01
+    bot = prices_bot(live(cfg), {"ETH/USDT": 2000})
+    bot.check_stops()
+    assert fake.balance["ETH"] == 0  # saldo bloqueado por el stop
+    bot.data.fetch_last_prices = lambda symbols: {"ETH/USDT": 2300}
+    assert bot.check_stops() == ["ETH/USDT"]
+    assert active_stops(fake) == []
+    assert fake.orders == [("ETH/USDT", "market", "sell", 0.01)]
+
+
+def test_no_market_sell_if_cancel_fails(cfg, fake):
+    bot = prices_bot(live(cfg), {"ETH/USDT": 2000})
+    bot.check_stops()
+
+    def reject(order_id, symbol):
+        raise ConnectionError("no se pudo cancelar")
+
+    fake.cancel_order = reject
+    bot.data.fetch_last_prices = lambda symbols: {"ETH/USDT": 2300}
+    assert bot.check_stops() == []
+    assert fake.orders == []
+    assert "ETH/USDT" in bot.storage.get_positions()
+
+
+def test_partial_stop_fill_is_merged_on_close(cfg, fake):
+    bot = prices_bot(live(cfg), {"ETH/USDT": 2000})
+    bot.check_stops()
+    active_stops(fake)[0].update(filled=0.004, average=1000.0)
+    bot.data.fetch_last_prices = lambda symbols: {"ETH/USDT": 2300}
+    assert bot.check_stops() == ["ETH/USDT"]
+    assert fake.orders == [("ETH/USDT", "market", "sell", 0.006)]
+    trade = bot.storage.trades().iloc[0]
+    assert trade["qty"] == pytest.approx(0.01)
+    assert trade["price"] == pytest.approx((0.004 * 1000 + 0.006 * PRICE) / 0.01)
+
+
+def test_canceled_stop_is_replaced(cfg, fake):
+    bot = prices_bot(live(cfg), {"ETH/USDT": 2000})
+    bot.check_stops()
+    list(fake.stops.values())[0]["status"] = "canceled"
+    bot.check_stops()
+    assert len(active_stops(fake)) == 1
+    assert "ETH/USDT" in bot.storage.get_positions()
+
+
+def test_stop_placement_failure_keeps_bot_running(cfg, fake):
+    bot = prices_bot(live(cfg), {"ETH/USDT": 2000})
+
+    def reject(*args):
+        raise ConnectionError("rechazada")
+
+    fake.create_order = reject
+    assert bot.check_stops() == []
+    assert "ETH/USDT" in bot.storage.get_positions()
+
+
+def test_exchange_stops_can_be_disabled(cfg, fake):
+    bot = prices_bot(override(live(cfg), execution__exchange_stops=False), {"ETH/USDT": 2000})
+    bot.check_stops()
+    assert fake.stops == {}
+
+
+def test_live_refuses_exchange_without_stops(cfg, storage, fake, monkeypatch):
+    monkeypatch.setattr(FakeExchange, "has", {})
+    with pytest.raises(RuntimeError, match="órdenes de stop"):
+        LiveBroker(live(cfg), storage)
+
+
+# ---------------------------------------------------------------- límite de pérdida diaria
+TS = "2026-01-01T12:00:00+00:00"
+
+
+def test_daily_loss_closes_positions(cfg):
+    bot = prices_bot(cfg, {"ETH/USDT": 2000})
+    bot.storage.record_equity("2026-01-01T00:00:00+00:00", 11000, 11000, 0, 0)
+    assert bot.check_stops(TS) == ["ETH/USDT"]
+    assert bot.storage.trades().iloc[0]["reason"] == "kill_switch_daily_loss"
+
+
+def test_daily_loss_blocks_new_entries(cfg):
+    bot = prices_bot(cfg, {"ETH/USDT": 2000})
+    bot.storage.record_equity("2026-01-01T00:00:00+00:00", 11000, 11000, 0, 0)
+    bot.check_stops(TS)
+    assert bot.risk.can_open(0, 11000, bot.broker.cash()) == (False, "kill_switch_daily_loss")
+
+
+def test_daily_loss_not_reached_keeps_positions(cfg):
+    bot = prices_bot(cfg, {"ETH/USDT": 2000})
+    bot.storage.record_equity("2026-01-01T00:00:00+00:00", 10000, 10000, 0, 0)
+    assert bot.check_stops(TS) == []
+
+
+def test_daily_loss_ignores_previous_day(cfg):
+    bot = prices_bot(cfg, {"ETH/USDT": 2000})
+    bot.storage.record_equity("2025-12-31T23:00:00+00:00", 11000, 11000, 0, 0)
+    assert bot.check_stops(TS) == []
+
+
+def test_daily_loss_can_be_disabled(cfg):
+    c = override(cfg, risk__close_on_daily_loss=False)
+    bot = prices_bot(c, {"ETH/USDT": 2000})
+    bot.storage.record_equity("2026-01-01T00:00:00+00:00", 11000, 11000, 0, 0)
+    assert bot.check_stops(TS) == []
+
+
+def test_daily_loss_waits_for_all_prices(cfg):
+    bot = prices_bot(cfg, {"ETH/USDT": 2000})
+    bot.storage.upsert_position(Position("BTC/USDT", 0.01, PRICE, "", 1900, 2200))
+    bot.storage.record_equity("2026-01-01T00:00:00+00:00", 11000, 11000, 0, 0)
+    assert bot.check_stops(TS) == []
+
+
+def test_daily_loss_sends_live_sell(cfg, fake):
+    bot = prices_bot(live(cfg, capital=100), {"ETH/USDT": 2000})
+    bot.storage.record_equity("2026-01-01T00:00:00+00:00", 1000, 100, 0, 0)
+    assert bot.check_stops(TS) == ["ETH/USDT"]
+    assert active_stops(fake) == []
+    assert fake.orders == [("ETH/USDT", "market", "sell", 0.01)]
+
+
+# ---------------------------------------------------------------- configs por cuenta
+def test_testnet_and_live_configs_are_separate():
+    testnet, real = load_config(ROOT / "config.testnet.yaml"), load_config(ROOT / "config.live.yaml")
+    assert testnet["exchange"]["sandbox"] is True and real["exchange"]["sandbox"] is False
+    assert testnet["execution"]["mode"] == real["execution"]["mode"] == "live"
+    assert testnet["storage"]["db_path"] != real["storage"]["db_path"]
+    assert account_id(testnet) != account_id(real)
+
+
+def test_live_config_stays_blocked_until_capital_is_set(tmp_path, fake):
+    real = load_config(ROOT / "config.live.yaml")
+    with pytest.raises(RuntimeError, match="max_live_capital"):
+        LiveBroker(real, Storage(str(tmp_path / "t.db")))

@@ -46,7 +46,8 @@ risk:
   reward_risk: 2.0           # take profit = 2R
   trailing_stop: true
   max_holding_bars: 48
-  max_daily_loss_pct: 0.05   # kill switch: sin nuevas entradas si se pierde 5% en el día
+  max_daily_loss_pct: 0.05   # kill switch: sin nuevas entradas si se pierde 5% en el día (UTC)
+  close_on_daily_loss: true  # además, cerrar todas las posiciones al llegar a ese límite
   min_notional: 10
 
 execution:
@@ -54,6 +55,8 @@ execution:
   fee_rate: 0.001
   slippage: 0.0005
   max_live_capital: 0        # capital máximo (en quote) que el bot puede usar en modo live; con 0 el modo live no arranca
+  exchange_stops: true       # modo live: mantener un stop-limit en el exchange por cada posición
+  stop_limit_buffer: 0.01    # precio límite del stop: 1% por debajo del disparo
 
 bot:
   loop_seconds: 300

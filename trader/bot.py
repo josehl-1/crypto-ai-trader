@@ -46,6 +46,7 @@ class TradingBot:
         closed = stopped + self._manage_positions(frames, sig, ts)
         prices ={s: float(df["close"].iloc[-1]) for s, df in frames.items()}
         opened = self._open_positions(frames, scan, prices, ts)
+        closed += self._sync_exchange_stops(ts)
 
         positions = self.storage.get_positions()
         exposure = sum(p.qty * prices.get(s, p.entry_price) for s, p in positions.items())
@@ -81,34 +82,70 @@ class TradingBot:
                 log.exception("Error vigilando stops")
 
     def check_stops(self, ts: str | None = None) -> list[str]:
-        """Compara stops y take profits con el precio actual, sin esperar a que cierre la vela."""
+        """Sincroniza los stops del exchange y compara stops, take profits y el límite de pérdida
+        diaria con el precio actual, sin esperar a que cierre la vela."""
+        ts = ts or utcnow()
+        closed = self._sync_exchange_stops(ts)
         positions = self.storage.get_positions()
         if not positions:
-            return []
+            return closed
         try:
             prices = self.data.fetch_last_prices(list(positions))
         except Exception as e:  # noqa: BLE001
             log.warning("Stops sin vigilar: no se pudo obtener el precio actual (%s)", e)
-            return []
-        ts = ts or utcnow()
-        closed = []
+            return closed
         for sym, pos in positions.items():
             price = prices.get(sym)
             if price is None:
                 continue
             reason = "stop_loss" if price <= pos.stop else "take_profit" if price >= pos.take_profit else None
-            if reason is None:
-                continue
-            try:
-                self._close(pos, price, reason, ts)
+            if reason and self._try_close(pos, price, reason, ts):
                 closed.append(sym)
+        return closed + self._enforce_daily_loss(prices, ts)
+
+    def _sync_exchange_stops(self, ts: str) -> list[str]:
+        """Registra los stops ya ejecutados en el exchange y coloca o sube los que falten."""
+        closed = []
+        for sym, pos in self.storage.get_positions().items():
+            try:
+                fill = self.broker.stop_fill(pos)
+                if fill:
+                    self._record_close(pos, fill, "exchange_stop", ts)
+                    closed.append(sym)
+                else:
+                    self.broker.protect(pos)
             except Exception:  # noqa: BLE001  se reintenta en la siguiente comprobación
-                log.exception("No se pudo cerrar %s (%s)", sym, reason)
+                log.exception("Stop de %s sin sincronizar con el exchange", sym)
         return closed
 
+    def _enforce_daily_loss(self, prices: dict, ts: str) -> list[str]:
+        """Cierra todo si se supera max_daily_loss_pct; can_open bloquea entradas el resto del día."""
+        positions = self.storage.get_positions()
+        if not self.cfg["risk"].get("close_on_daily_loss", True) or not positions or any(s not in prices for s in positions):
+            return []
+        try:
+            equity = self.broker.cash() + sum(p.qty * prices[s] for s, p in positions.items())
+        except Exception as e:  # noqa: BLE001
+            log.warning("Límite diario sin vigilar: no se pudo obtener el saldo (%s)", e)
+            return []
+        if not self.risk.daily_loss_hit(self.storage.day_start_equity(ts[:10]), equity):
+            return []
+        log.warning("Límite de pérdida diaria superado (capital %.2f): cerrando %d posiciones", equity, len(positions))
+        return [s for s, p in positions.items() if self._try_close(p, prices[s], "kill_switch_daily_loss", ts)]
+
     # ------------------------------------------------------------------
+    def _try_close(self, pos: Position, ref_price: float, reason: str, ts: str) -> bool:
+        try:
+            self._close(pos, ref_price, reason, ts)
+            return True
+        except Exception:  # noqa: BLE001  se reintenta en la siguiente comprobación
+            log.exception("No se pudo cerrar %s (%s)", pos.symbol, reason)
+            return False
+
     def _close(self, pos: Position, ref_price: float, reason: str, ts: str):
-        fill = self.broker.sell(pos.symbol, pos.qty, ref_price)
+        self._record_close(pos, self.broker.sell(pos.symbol, pos.qty, ref_price), reason, ts)
+
+    def _record_close(self, pos: Position, fill, reason: str, ts: str):
         pnl = (fill.price - pos.entry_price) * fill.qty - fill.fee - pos.entry_fee
         self.storage.log_trade(ts, pos.symbol, "SELL", fill.qty, fill.price, fill.fee, reason, pnl, self.broker.mode)
         self.storage.delete_position(pos.symbol)
@@ -134,8 +171,8 @@ class TradingBot:
             if exit_:
                 price, reason = exit_
                 # en real solo podemos vender a mercado ahora (stops gestionados por el bot)
-                self._close(pos, float(df["close"].iloc[-1]) if live else price, reason, ts)
-                closed.append(sym)
+                if self._try_close(pos, float(df["close"].iloc[-1]) if live else price, reason, ts):
+                    closed.append(sym)
             else:
                 self.storage.upsert_position(pos)
         return closed
@@ -173,4 +210,8 @@ class TradingBot:
                                    f"p_up={row['prob_up']:.2f} q50={row['q50']:.4f}", 0.0, self.broker.mode)
             log.info("ABIERTA %s qty=%.6g @ %.6g SL=%.6g TP=%.6g", pos.symbol, pos.qty, pos.entry_price, pos.stop, pos.take_profit)
             opened.append(pos.symbol)
+            try:
+                self.broker.protect(pos)
+            except Exception:  # noqa: BLE001  se reintenta en la siguiente comprobación
+                log.exception("%s abierta sin stop en el exchange", pos.symbol)
         return opened

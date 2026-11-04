@@ -55,8 +55,8 @@ tests/                tests de extremo a extremo (pytest)
 
 ## Trading real (bajo tu responsabilidad)
 
-1. Prueba primero en **testnet**: pon `exchange.sandbox: true` en el config y usa claves de testnet.
-2. Pon `execution.mode: live` y define `execution.max_live_capital`: el capital máximo que el bot puede usar. Con 0 el modo live no arranca. Usa un `storage.db_path` propio para cada cuenta: el bot no arranca con una base de datos de otra cuenta (paper, testnet o real).
+1. Prueba primero en **testnet** con `config.testnet.yaml` (usa `data/testnet.db`) y claves de testnet. Para dinero real se usa `config.live.yaml` (usa `data/live.db`).
+2. En `config.live.yaml` define `execution.max_live_capital`: el capital máximo que el bot puede usar. Con 0 el modo live no arranca. Cada cuenta necesita su propio `storage.db_path`: el bot no arranca con una base de datos de otra cuenta (paper, testnet o real).
 3. Exporta tus credenciales (con permiso de trading y **sin** permiso de retiro):
 
 ```bash
@@ -65,9 +65,11 @@ export EXCHANGE_API_SECRET=...
 export CONFIRM_LIVE_TRADING=YES
 ```
 
-4. Ejecuta `python main.py bot`.
+4. Ejecuta `python main.py bot --config config.testnet.yaml` (o `config.live.yaml`).
 
-Limitaciones del modo live: solo opera en spot y solo en largo. El bot compara los stops y take profits con el precio actual cada `bot.stop_check_seconds` y los ejecuta a mercado, así que la venta puede salir peor que el stop. No se colocan como órdenes en el exchange: si el bot está detenido, nada protege tus posiciones. En modo live el bot no arranca con datos sintéticos.
+Protecciones del modo live: cada posición tiene una orden stop-limit en el exchange, que sigue activa aunque el bot esté detenido y sube con el trailing stop. El bot compara además stops y take profits con el precio actual cada `bot.stop_check_seconds` y vende a mercado si hace falta. Si se supera `risk.max_daily_loss_pct` (día UTC), cierra todas las posiciones y no abre nuevas ese día. En modo live el bot no arranca con datos sintéticos.
+
+Limitaciones: solo opera en spot y solo en largo. Un stop-limit no garantiza la venta: si el precio cae por debajo del límite (`execution.stop_limit_buffer`), la orden queda sin ejecutar hasta que el bot, si está en marcha, venda a mercado. Con el bot detenido no funcionan el take profit, el trailing stop, la salida por tiempo ni el límite de pérdida diaria.
 
 ## Aviso importante
 

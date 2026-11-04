@@ -47,6 +47,9 @@ class Storage:
     def set_state(self, key, value):
         self._exec("INSERT OR REPLACE INTO state VALUES (?,?)", (key, str(value)))
 
+    def delete_state(self, key):
+        self._exec("DELETE FROM state WHERE key=?", (key,))
+
     # --- cuenta dueña de esta base de datos ---
     def check_account(self, account: str):
         """Una base de datos pertenece a una sola cuenta: las posiciones de otra (simuladas o de

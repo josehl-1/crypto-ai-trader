@@ -33,10 +33,13 @@ class RiskManager:
             return 0.0, 0.0, 0.0
         return qty, price - stop_dist, price + self.r["reward_risk"] * stop_dist
 
+    def daily_loss_hit(self, day_start_equity: float | None, equity: float) -> bool:
+        return bool(day_start_equity) and equity < day_start_equity * (1 - self.r["max_daily_loss_pct"])
+
     def can_open(self, n_open: int, day_start_equity: float | None, equity: float) -> tuple[bool, str]:
         if n_open >= self.r["max_open_positions"]:
             return False, "max_open_positions"
-        if day_start_equity and equity < day_start_equity * (1 - self.r["max_daily_loss_pct"]):
+        if self.daily_loss_hit(day_start_equity, equity):
             return False, "kill_switch_daily_loss"
         return True, ""
 
