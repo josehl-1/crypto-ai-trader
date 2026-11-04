@@ -5,6 +5,7 @@ import pandas as pd
 import pytest
 
 import trader.broker as broker_mod
+from probar_ordenes_testnet import run_checks
 from trader.bot import TradingBot
 from trader.broker import LiveBroker, account_id, make_broker
 from trader.config import ROOT, load_config, override
@@ -18,6 +19,7 @@ PRICE = 2000.0
 class FakeExchange:
     id = "fake"
     has = {"createStopLossOrder": True}
+    urls = {"api": {"public": "https://testnet.binance.vision/api/v3"}}
 
     def __init__(self):
         self.balance = {"USDT": 1000.0, "ETH": 5.0, "BTC": 5.0}
@@ -42,6 +44,12 @@ class FakeExchange:
 
     def price_to_precision(self, symbol, price):
         return f"{price:.2f}"
+
+    def fetch_ticker(self, symbol):
+        return {"last": PRICE}
+
+    def fetch_open_orders(self, symbol):
+        return [o for o in self.stops.values() if o["status"] == "open"]
 
     def fetch_order(self, order_id, symbol):
         return self.stops[order_id]
@@ -453,6 +461,45 @@ def test_daily_loss_sends_live_sell(cfg, fake):
     assert bot.check_stops(TS) == ["ETH/USDT"]
     assert active_stops(fake) == []
     assert fake.orders == [("ETH/USDT", "market", "sell", 0.01)]
+
+
+# ---------------------------------------------------------------- prueba de órdenes en testnet
+def order_check_broker(cfg):
+    return LiveBroker(live(cfg, capital=1000, sandbox=True), Storage(":memory:"))
+
+
+def test_order_check_passes_and_restores_account(cfg, fake):
+    assert run_checks(order_check_broker(cfg), out=lambda line: None) is True
+    assert [o[2] for o in fake.orders] == ["buy", "sell"]
+    assert len(fake.stops) == 2 and active_stops(fake) == []
+    assert fake.balance["ETH"] == pytest.approx(5.0)
+    assert fake.balance["USDT"] == pytest.approx(1000.0)
+
+
+def test_order_check_refuses_real_exchange(cfg, fake, monkeypatch):
+    monkeypatch.setattr(FakeExchange, "urls", {"api": {"public": "https://api.binance.com/api/v3"}})
+    with pytest.raises(RuntimeError, match="testnet"):
+        run_checks(order_check_broker(cfg), out=lambda line: None)
+    assert fake.orders == []
+
+
+def test_order_check_failure_sells_test_position(cfg, fake):
+    fake.fetch_open_orders = lambda symbol: []  # el stop no aparece en el exchange
+    lines = []
+    assert run_checks(order_check_broker(cfg), out=lines.append) is False
+    assert any(line.startswith("FALLO") for line in lines)
+    assert [o[2] for o in fake.orders] == ["buy", "sell"]
+    assert active_stops(fake) == []
+
+
+def test_order_check_reports_rejected_buy(cfg, fake):
+    def reject(*args):
+        raise ConnectionError("rechazada")
+
+    fake.create_order = reject
+    lines = []
+    assert run_checks(order_check_broker(cfg), out=lines.append) is False
+    assert any("rechazada" in line for line in lines)
 
 
 # ---------------------------------------------------------------- configs por cuenta
