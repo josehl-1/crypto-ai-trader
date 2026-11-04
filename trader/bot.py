@@ -33,6 +33,7 @@ class TradingBot:
     # ------------------------------------------------------------------
     def run_cycle(self) -> dict:
         ts = utcnow()
+        stopped = self.check_stops(ts)
         positions = self.storage.get_positions()
         symbols = list(dict.fromkeys(self.data.resolve_universe() + list(positions)))
         t0 = time.time()
@@ -42,8 +43,8 @@ class TradingBot:
         log.info("Escaneados %d/%d símbolos en %.1fs", len(scan), len(symbols), time.time() - t0)
         sig = scan.set_index("symbol") if not scan.empty else pd.DataFrame()
 
-        closed = self._manage_positions(frames, sig, ts)
-        prices = {s: float(df["close"].iloc[-1]) for s, df in frames.items()}
+        closed = stopped + self._manage_positions(frames, sig, ts)
+        prices ={s: float(df["close"].iloc[-1]) for s, df in frames.items()}
         opened = self._open_positions(frames, scan, prices, ts)
 
         positions = self.storage.get_positions()
@@ -66,7 +67,44 @@ class TradingBot:
                 raise
             except Exception:  # noqa: BLE001  el bot no debe morir por un error puntual
                 log.exception("Error en el ciclo")
-            time.sleep(max(5, loop - (time.time() - start)))
+            self._watch_stops(max(5, loop - (time.time() - start)))
+
+    def _watch_stops(self, seconds: float):
+        """Espera hasta el próximo ciclo vigilando los stops cada bot.stop_check_seconds."""
+        end = time.time() + seconds
+        check = float(self.cfg["bot"].get("stop_check_seconds", 30))
+        while (left := end - time.time()) > 0:
+            time.sleep(min(check, left))
+            try:
+                self.check_stops()
+            except Exception:  # noqa: BLE001  el bot no debe morir por un error puntual
+                log.exception("Error vigilando stops")
+
+    def check_stops(self, ts: str | None = None) -> list[str]:
+        """Compara stops y take profits con el precio actual, sin esperar a que cierre la vela."""
+        positions = self.storage.get_positions()
+        if not positions:
+            return []
+        try:
+            prices = self.data.fetch_last_prices(list(positions))
+        except Exception as e:  # noqa: BLE001
+            log.warning("Stops sin vigilar: no se pudo obtener el precio actual (%s)", e)
+            return []
+        ts = ts or utcnow()
+        closed = []
+        for sym, pos in positions.items():
+            price = prices.get(sym)
+            if price is None:
+                continue
+            reason = "stop_loss" if price <= pos.stop else "take_profit" if price >= pos.take_profit else None
+            if reason is None:
+                continue
+            try:
+                self._close(pos, price, reason, ts)
+                closed.append(sym)
+            except Exception:  # noqa: BLE001  se reintenta en la siguiente comprobación
+                log.exception("No se pudo cerrar %s (%s)", sym, reason)
+        return closed
 
     # ------------------------------------------------------------------
     def _close(self, pos: Position, ref_price: float, reason: str, ts: str):
@@ -125,12 +163,12 @@ class TradingBot:
             fill = self.broker.buy(row["symbol"], qty, price)
             if fill.qty <= 0:
                 continue
-            cash = self.broker.cash()
             stop_dist = price - stop
             pos = Position(row["symbol"], fill.qty, fill.price, ts, fill.price - stop_dist,
                            fill.price + self.cfg["risk"]["reward_risk"] * stop_dist, fill.fee,
                            str(frames[row["symbol"]].index[-1]), 0)
             self.storage.upsert_position(pos)
+            cash = self.broker.cash()
             self.storage.log_trade(ts, pos.symbol, "BUY", fill.qty, fill.price, fill.fee,
                                    f"p_up={row['prob_up']:.2f} q50={row['q50']:.4f}", 0.0, self.broker.mode)
             log.info("ABIERTA %s qty=%.6g @ %.6g SL=%.6g TP=%.6g", pos.symbol, pos.qty, pos.entry_price, pos.stop, pos.take_profit)

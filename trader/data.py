@@ -76,6 +76,17 @@ class MarketData:
         # nunca rellenar con datos falsos si se opera con dinero real
         self.fallback = cfg["data"].get("synthetic_fallback", False) and cfg["execution"]["mode"] == "paper"
         self.concurrency = int(cfg["universe"].get("max_concurrency", 8))
+        self._ticker_ex = None
+
+    # ---------------- precio actual ----------------
+    def fetch_last_prices(self, symbols: list[str]) -> dict[str, float]:
+        """Último precio negociado, para vigilar stops sin esperar a que cierre la vela."""
+        if self.source != "exchange" or not symbols:
+            return {}
+        if self._ticker_ex is None:
+            self._ticker_ex = getattr(ccxt, self.ex_id)({"enableRateLimit": True})
+        tickers = self._ticker_ex.fetch_tickers(symbols)
+        return {s: float(tickers[s]["last"]) for s in symbols if s in tickers and tickers[s].get("last")}
 
     # ---------------- universo ----------------
     def resolve_universe(self) -> list[str]:

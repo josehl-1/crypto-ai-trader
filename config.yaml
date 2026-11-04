@@ -53,9 +53,11 @@ execution:
   mode: paper                # paper | live
   fee_rate: 0.001
   slippage: 0.0005
+  max_live_capital: 0        # capital máximo (en quote) que el bot puede usar en modo live; con 0 el modo live no arranca
 
 bot:
   loop_seconds: 300
+  stop_check_seconds: 30     # cada cuánto se comparan stops y take profits con el precio actual
 
 backtest:
   min_train_bars: 800

@@ -47,6 +47,22 @@ class Storage:
     def set_state(self, key, value):
         self._exec("INSERT OR REPLACE INTO state VALUES (?,?)", (key, str(value)))
 
+    # --- cuenta dueña de esta base de datos ---
+    def check_account(self, account: str):
+        """Una base de datos pertenece a una sola cuenta: las posiciones de otra (simuladas o de
+        testnet) no se deben gestionar con órdenes de esta."""
+        bound = self.get_state("account")
+        if bound is None and self._has_activity():  # base anterior a este control
+            bound = "paper" if self.get_state("paper_cash") is not None else "desconocida"
+        if bound not in (None, account):
+            raise RuntimeError(f"La base de datos pertenece a la cuenta '{bound}' y se intentó usar con "
+                               f"'{account}'. Usa otro storage.db_path para esta cuenta.")
+
+    def _has_activity(self) -> bool:
+        return self.get_state("paper_cash") is not None \
+            or self._exec("SELECT 1 FROM positions LIMIT 1").fetchone() is not None \
+            or self._exec("SELECT 1 FROM trades LIMIT 1").fetchone() is not None
+
     # --- señales ---
     def save_scan(self, scan: pd.DataFrame, scan_ts: str):
         if scan.empty:
@@ -86,6 +102,12 @@ class Storage:
 
     def record_equity(self, ts, equity, cash, exposure, n):
         self._exec("INSERT INTO equity VALUES (?,?,?,?,?)", (ts, equity, cash, exposure, n))
+
+    def realized_pnl(self) -> float:
+        return float(self._exec("SELECT COALESCE(SUM(pnl), 0) FROM trades").fetchone()[0])
+
+    def deployed_capital(self) -> float:
+        return sum(p.qty * p.entry_price + p.entry_fee for p in self.get_positions().values())
 
     def equity_curve(self) -> pd.DataFrame:
         return self._df("SELECT * FROM equity ORDER BY ts")

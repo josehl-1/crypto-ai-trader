@@ -56,7 +56,7 @@ tests/                tests de extremo a extremo (pytest)
 ## Trading real (bajo tu responsabilidad)
 
 1. Prueba primero en **testnet**: pon `exchange.sandbox: true` en el config y usa claves de testnet.
-2. Pon `execution.mode: live` en `config.yaml`.
+2. Pon `execution.mode: live` y define `execution.max_live_capital`: el capital máximo que el bot puede usar. Con 0 el modo live no arranca. Usa un `storage.db_path` propio para cada cuenta: el bot no arranca con una base de datos de otra cuenta (paper, testnet o real).
 3. Exporta tus credenciales (con permiso de trading y **sin** permiso de retiro):
 
 ```bash
@@ -67,7 +67,7 @@ export CONFIRM_LIVE_TRADING=YES
 
 4. Ejecuta `python main.py bot`.
 
-Limitaciones del modo live: solo opera en spot y solo en largo. Los stops y take profits los vigila el bot en cada ciclo y los ejecuta a mercado; no se colocan como órdenes en el exchange, así que si el bot está detenido nada protege tus posiciones. En modo live el bot nunca opera con datos sintéticos.
+Limitaciones del modo live: solo opera en spot y solo en largo. El bot compara los stops y take profits con el precio actual cada `bot.stop_check_seconds` y los ejecuta a mercado, así que la venta puede salir peor que el stop. No se colocan como órdenes en el exchange: si el bot está detenido, nada protege tus posiciones. En modo live el bot no arranca con datos sintéticos.
 
 ## Aviso importante
 
