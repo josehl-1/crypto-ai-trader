@@ -199,7 +199,10 @@ with tab_bot:
         st.subheader("Posiciones abiertas")
         st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
     st.subheader("Historial de operaciones")
-    st.dataframe(trades, hide_index=True, use_container_width=True) if not trades.empty else st.caption("Sin operaciones todavía.")
+    if trades.empty:
+        st.caption("Sin operaciones todavía.")
+    else:
+        st.dataframe(trades, hide_index=True, use_container_width=True)
 
 # ---------------------------------------------------------------- backtest
 with tab_bt:
